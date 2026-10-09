@@ -368,10 +368,59 @@ This project demonstrates two complementary patterns for batch file loading in A
 *   **For unrelated uploads**: Use Append Variable in the False branch to record all unrelated file names into an array (`v_file_array`).
 *   **For audit reporting**: Use `@string(variables('v_file_array'))` to convert the array into a readable string, and `@length(variables('v_file_array'))` to get the total count of unrelated files.
 
-## 12. Databricks Integration
+## 12. Databricks Integration (Silver Layer)
 
+After the ADF pipeline loads raw data into the Bronze layer, Databricks is used to transform the data into the Silver layer using Delta Lake and Unity Catalog.
 
+### 12.1 Writing to Delta Lake with Unity Catalog
 
+The following PySpark code writes a DataFrame to ADLS Gen2 as a Delta table and registers it in Unity Catalog:
+
+```python
+df.write.format('delta') \
+  .mode('append') \
+  .option("path", 'abfss://silver@xc797demo.dfs.core.windows.net/nocs') \
+  .saveAsTable("olympics.silver.nocs")
+```
+
+**What this does:**
+*   **Writes physical data** to `abfss://silver@xc797demo.dfs.core.windows.net/nocs` (Delta Parquet files + `_delta_log`).
+*   **Registers metadata** in Unity Catalog under `olympics.silver.nocs`.
+
+### 12.2 External Table vs. Managed Table
+
+When creating a Delta table in Unity Catalog, there are two possible approaches:
+
+| Approach | Code | Data Location | Managed By |
+| :--- | :--- | :--- | :--- |
+| **External Table** | Specify `option("path", ...)` | User-defined ADLS path | User |
+| **Managed Table** | Omit `option("path", ...)` | Unity Catalog root storage | Unity Catalog |
+
+**This project uses External Tables** because:
+1.  **Data location is explicit**: The data is stored in a known ADLS container (`silver`), making it accessible to other systems (e.g., Power BI, Synapse) without going through Databricks.
+2.  **No dependency on Unity Catalog root storage**: Managed Tables require a configured Storage Credential and Access Connector, which adds complexity and permission requirements.
+3.  **Drop-safe**: Dropping an External Table does not delete the underlying data, which prevents accidental data loss.
+
+### 12.3 Result Verification
+
+After running the code, verify the result in two places:
+
+*   **ADLS Gen2**: The `silver` container contains a `nocs` folder with Delta Parquet files and a `_delta_log` directory.
+*   **Unity Catalog**: The table `olympics.silver.nocs` is registered and queryable via SQL:
+    ```sql
+    SELECT * FROM olympics.silver.nocs LIMIT 10;
+    ```
+
+### 12.4 Note on Unity Catalog Metastore Storage
+
+The Unity Catalog Metastore is configured with a root storage path (`abfss://unitymetastore@xc797demo.dfs.core.windows.net/...`). This path is used exclusively for **Managed Tables**. Since this project uses **External Tables**, the Metastore root storage is not required for the tables created here. This simplifies the setup and avoids additional Azure-level configuration (Access Connector, Storage Credential, IAM role assignment).
+
+### 12.5 Summary
+
+*   **ADF** loads raw CSV files into the Bronze layer.
+*   **Databricks** reads Bronze data, applies transformations, and writes to the Silver layer as Delta tables.
+*   **External Tables** are used to maintain explicit control over data location and avoid Managed Table complexity.
+*   **Unity Catalog** provides metadata management, governance, and SQL access to the Silver tables.
 
 
 ## References
