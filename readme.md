@@ -576,7 +576,9 @@ After fixing the `taskValues.set` call (passing the array object, not a string),
 | 1 | `events` | `olympic.silver.events` | ✅ Succeeded |
 | 2 | `coaches` | `olympic.silver.coaches` | ✅ Succeeded |
 
-![For Each Run Result](assets/job_for_each_run.png)
+The DAG below shows the orchestration flow: `lookup` → `silver_loop` → `silver_loop_iteration`.
+
+![Job DAG](assets/job_dag.png)
 
 ## References
 
