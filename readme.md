@@ -604,6 +604,326 @@ The JSON string in the inputs field should be an array of primitives or objects
 
 This error is a typical example of how Databricks Task Values differ from ADF expressions, where parameters are usually string-based.
 
+### 12.8 Silver Layer Data Cleaning & Profiling
+
+Before writing data to the Silver layer, several cleaning and profiling steps are applied to ensure data quality. This section documents the specific issues found in the source data and how they were resolved.
+
+#### 12.8.1 Handling Missing Values in String Columns
+
+Several string columns contain empty values (e.g., `birth_place`, `birth_country`, `residence_place`, `residence_country`). To ensure consistency across the Silver layer, all missing values are replaced with a single, standard placeholder: `"unknown"`.
+
+```python
+df = df.fillna({
+    "birth_place": "unknown",
+    "birth_country": "unknown",
+    "residence_place": "unknown",
+    "residence_country": "unknown"
+})
+```
+
+**Why a single placeholder?**
+*   Using different placeholders (e.g., `"xyz"`, `"abc"`) for different columns makes downstream queries and aggregations inconsistent.
+*   `"unknown"` is semantically clear and easy to filter, count, and report on.
+
+#### 12.8.2 Schema Correction: Casting String to Float
+
+The `height` and `weight` columns were inferred as `string` during ingestion, but they should be numeric. This is a **schema issue** — without correction, any arithmetic operation (e.g., average height, BMI calculation) would fail or produce incorrect results.
+
+**Detection:**
+```python
+df.printSchema()
+```
+
+If `height` and `weight` are of type `string`, casting is required.
+
+**Fix:**
+```python
+df = df.withColumn('height', col('height').cast('float')) \
+       .withColumn('weight', col('weight').cast('float'))
+```
+
+**Verification:**
+```python
+df.printSchema()
+```
+
+#### 12.8.3 Handling Missing Values in Numeric Columns
+
+In the source data, missing values for `height` and `weight` are represented as `0.0` (not `NULL`). This is a common data quality issue: the source system encodes "missing" as zero, which is misleading and can distort statistics.
+
+**Detection:**
+```python
+df.filter(col('weight') == 0).count()
+```
+
+**Cleaning:**
+```python
+df_clean = df.filter(
+    (col('height') > 0) & (col('weight') > 0)
+)
+```
+
+**Why filter instead of replacing with `0`?**
+*   Zero is not a valid height or weight for an athlete. Keeping it would skew averages and min/max calculations.
+*   Filtering removes the invalid records entirely, leaving only valid numeric data.
+
+#### 12.8.4 Data Profiling: Distribution of the `current` Column
+
+Before deciding whether to keep or drop a column, its distribution is profiled. The `current` column indicates whether an athlete is currently active.
+
+```python
+df.groupBy("current").count().display()
+```
+
+**Result:**
+
+| current | count |
+| :--- | :--- |
+| False | 3 |
+| True | 6561 |
+
+**Observations:**
+*   The column is **not constant** (it has both `True` and `False`), so it carries business value and should be retained.
+*   The distribution is **highly skewed** (6561 vs 3). This is worth noting for downstream analytics or machine learning tasks.
+*   The 3 `False` records were manually inspected to confirm they represent genuinely retired athletes, not dirty data.
+
+#### 12.8.5 Multi-Column Sorting with Mixed Directions
+
+PySpark's `sort()` supports sorting by multiple columns with different directions.
+
+```python
+df_sort = df.filter(col('weight') > 0) \
+            .sort('height', 'weight', ascending=[0, 1])
+
+df_sort.display()
+```
+
+**Explanation:**
+*   `ascending=[0, 1]` means:
+    *   `0` → `height` is sorted **descending** (tallest first)
+    *   `1` → `weight` is sorted **ascending** (lightest first)
+
+**Why this matters:**
+This is a form of **data profiling**. By sorting by height and weight, you can quickly identify the tallest, lightest, and potential outliers in the dataset.
+
+#### 12.8.6 Standardizing Column Values with `regexp_replace`
+
+Some string columns contain inconsistent values. For example, the `nationality` column uses the full country name (`United States`), while other columns use the country code (`US`).
+
+```python
+df_sort = df_sort.withColumn(
+    'nationality',
+    regexp_replace('nationality', 'United States', 'US')
+)
+```
+
+**Why this matters:**
+*   Inconsistent values cause Join failures, GroupBy duplication, and incorrect aggregations.
+*   Standardizing values in the Silver layer ensures downstream Gold layer aggregations are accurate and reliable.
+
+#### 12.8.7 Duplicate Detection on Business Keys
+
+Before writing to the Silver layer, it's important to verify that the business key (e.g., `code`) is unique.
+
+**Detection:**
+```python
+df.groupBy("code") \
+  .agg(count("code").alias("total_count")) \
+  .filter(col("total_count") > 1) \
+  .display()
+```
+
+**Interpretation:**
+*   **Empty result** → `code` is unique. No duplicates exist.
+*   **Non-empty result** → The listed `code` values appear more than once and need to be investigated.
+
+**Resolution options:**
+*   **Drop duplicates**: `df.dropDuplicates(["code"])`
+*   **Keep the latest record**: Use `row_number()` with a window function partitioned by `code`.
+*   **Aggregate**: If duplicates are legitimate (e.g., a code appears in multiple events), use `groupBy` to aggregate before writing to Silver.
+
+#### 12.8.8 Handling Multi-Value Columns (Comma-Separated Strings)
+
+Some columns contain multiple values separated by commas. For example, `occupation` might be:
+
+```
+"Athlete, strength and conditioning coach"
+```
+
+**Step 1: Split the string into an array**
+```python
+df = df.withColumn('occupation', split(col('occupation'), ','))
+```
+
+**Step 2: Trim each element in the array**
+```python
+from pyspark.sql.functions import transform, trim
+
+df = df.withColumn(
+    'occupation',
+    transform(col('occupation'), lambda x: trim(x))
+)
+```
+
+**Combined into a single step:**
+```python
+from pyspark.sql.functions import split, transform, trim
+
+df = df.withColumn(
+    'occupation',
+    transform(split(col('occupation'), ','), lambda x: trim(x))
+)
+```
+
+**Common Error (DataType Mismatch):**
+If you run `transform(col('occupation'), lambda x: trim(x))` **directly on a String column**, Spark will throw:
+```
+DATATYPE_MISMATCH.UNEXPECTED_INPUT_TYPE: The first parameter requires the "ARRAY" type, however "occupation" has the type "STRING".
+```
+
+**Rule of thumb:**
+*   `split` → String to Array
+*   `transform` → Array to Array (element-wise)
+*   `concat_ws` → Array to String
+
+#### 12.8.9 Selecting Relevant Columns for the Silver Layer
+
+After cleaning, the DataFrame may still contain columns that are not needed downstream. A final projection step is applied to keep only the columns that carry business value.
+
+**Step 1: List all columns**
+```python
+df_sort.columns
+```
+
+**Step 2: Select only the relevant columns**
+```python
+df_final = df_sort.select(
+    'athlete_code', 'current', 'name', 'name_short', 'name_tv',
+    'gender', 'function', 'country_code', 'country', 'country_long',
+    'nationality', 'nationality_long', 'nationality_code',
+    'height', 'weight'
+)
+
+display(df_final)
+```
+
+**Why this matters:**
+*   Reduces storage footprint (fewer columns → smaller Delta files).
+*   Prevents downstream tools from being confused by unused columns.
+*   Makes the Silver schema explicit and stable.
+
+#### 12.8.10 Viewing a Single Column
+
+To inspect a single column, use `.select()` before `.display()`:
+
+```python
+df_sort.select('occupation').display()
+```
+
+**Common Mistake:**
+```python
+df_sort.display('occupation')   # ❌ .display() does not accept column names
+df_sort['occupation'].display() # ❌ returns a Column, not a DataFrame
+```
+
+**Why `.select()` first?**
+Spark performs **column pruning** — it only reads the columns you actually need. This makes `.select('col').display()` significantly faster than `.display()` on the full DataFrame.
+
+#### 12.8.11 Data Distribution Visualization: Gender Ratio
+
+A Pie chart is used to visualize the distribution of male and female athletes.
+
+**Setup:**
+*   **Visualization type**: Pie
+*   **X column**: `gender`
+*   **Y columns**: `Count of gender`
+
+**Result:**
+
+*   **Male**: 55.42%
+*   **Female**: 44.58%
+
+![Gender Distribution](assets/gender_distribution.png)
+
+**Why this matters:**
+Confirms the dataset is balanced. If one category dominates disproportionately, it may indicate a filtering or ingestion issue.
+
+#### 12.8.12 Data Distribution Visualization: Top 10 Nationalities
+
+To understand which countries have the most athletes, the data is aggregated by `nationality` and limited to the top 10.
+
+**Step 1: Aggregate and sort**
+```python
+df_top10 = df_final.groupBy("nationality") \
+    .count() \
+    .orderBy(col("count").desc()) \
+    .limit(10)
+
+df_top10.display()
+```
+
+**Step 2: Configure the visualization**
+*   **Visualization type**: Bar
+*   **X column**: `nationality`
+*   **Y columns**: `count`
+*   **Sort values**: Enabled (descending)
+
+**Result:**
+
+![Top 10 Nationalities](assets/top10_nationalities.png)
+
+**Key insight:**
+
+| Rank | Nationality | Count |
+| :--- | :--- | :--- |
+| 1 | Japan | 25 |
+| 2 | Fiji | 23 |
+| 3 | New Zealand | 19 |
+| 4 | South Africa | 19 |
+| 5 | Ireland | 18 |
+| 6 | US | 17 |
+| 7 | Australia | 17 |
+| 8 | France | 14 |
+| 9 | Uruguay | 14 |
+| 10 | China | 13 |
+
+#### 12.8.13 Data Distribution Visualization: Height vs. Weight
+
+A scatter plot is used to visualize the relationship between athlete height and weight.
+
+**Setup:**
+*   **Visualization type**: Scatter
+*   **X column**: `weight`
+*   **Y column**: `height`
+
+**Result:**
+
+![Height vs Weight Scatter Plot](assets/height_weight_scatter.png)
+
+**Key insights:**
+*   A clear **positive correlation**: taller athletes tend to weigh more.
+*   Most athletes cluster between **60–90 kg** in weight and **170–190 cm** in height.
+*   A small number of **outliers** appear in the lower-left (light and short) and upper-right (heavy and tall) regions.
+
+#### 12.8.14 Summary of Silver Layer Cleaning Steps
+
+| Step | Issue | Resolution |
+| :--- | :--- | :--- |
+| 1 | Missing string values | `fillna` with `"unknown"` |
+| 2 | `height` / `weight` inferred as `string` | Cast to `float` |
+| 3 | Missing numeric values represented as `0.0` | Filter out rows where `height <= 0` or `weight <= 0` |
+| 4 | Unknown column distribution | `groupBy` profiling before retaining or dropping |
+| 5 | Multi-column sorting with mixed directions | `sort(..., ascending=[0, 1])` |
+| 6 | Inconsistent string values | `regexp_replace` to standardize |
+| 7 | Duplicate business keys | Detect with `groupBy` + `count` + `filter` |
+| 8 | Multi-value comma-separated columns | `split` + `transform` + `trim` |
+| 9 | Unused columns | `select()` to keep only relevant columns |
+| 10 | Need to inspect one column | `select()` before `display()` |
+| 11 | Gender ratio | Pie chart |
+| 12 | Top 10 nationalities | Bar chart with `.limit(10)` |
+| 13 | Height vs. weight correlation | Scatter plot |
+
+
 ## References
 
 *   **Course Video**: [YouTube Tutorial - Azure Data Factory Project](https://www.youtube.com/watch?v=ESWqAZP2qA4&t=2s)
