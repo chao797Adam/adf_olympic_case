@@ -580,6 +580,30 @@ The DAG below shows the orchestration flow: `lookup` → `silver_loop` → `silv
 
 ![Job DAG](assets/job_dag.png)
 
+#### 12.7.7 Common Pitfall: Task Values Must Pass Objects, Not Strings
+
+A common mistake when using `dbutils.jobs.taskValues.set()` is wrapping the `value` argument in quotes:
+
+```python
+# ❌ Incorrect: passes the string "my_array", not the array object
+dbutils.jobs.taskValues.set(key="my_output", value="my_array")
+
+# ✅ Correct: passes the array object itself
+dbutils.jobs.taskValues.set(key="my_output", value=my_array)
+```
+
+**Rule of thumb:**
+*   `key` is a **name** → wrap it in quotes (e.g., `"my_output"`).
+*   `value` is an **object** → do NOT wrap it in quotes (unless you intentionally want to pass a string literal).
+
+The downstream `For each` Task expects an array of objects. If a string is passed instead, the Job will fail with:
+
+```
+The JSON string in the inputs field should be an array of primitives or objects
+```
+
+This error is a typical example of how Databricks Task Values differ from ADF expressions, where parameters are usually string-based.
+
 ## References
 
 *   **Course Video**: [YouTube Tutorial - Azure Data Factory Project](https://www.youtube.com/watch?v=ESWqAZP2qA4&t=2s)
