@@ -475,11 +475,11 @@ By changing the `folder` widget value, the same Notebook can process different d
 
 ### 12.7 Orchestrating Multiple Tables with Databricks Jobs
 
-Instead of using a Python `for` loop, this project uses **Databricks Jobs** to orchestrate the processing of multiple tables. Parameters are passed between Tasks using **Task Values**, and the ingestion Notebook remains fully parameterized via **Widgets**.
+Instead of hardcoding one Task per table, this project uses a **`For each` Task** in Databricks Jobs to dynamically iterate through an array of table parameters. This is the Databricks equivalent of ADF's Lookup + ForEach pattern.
 
 #### 12.7.1 Notebook A: Parameterized Ingestion
 
-Notebook A is a fully parameterized Notebook. It does not care where the parameters come from — it only reads them via **Widgets** and performs the dynamic read/write.
+Notebook A is fully parameterized via **Widgets**. It does not care how many tables exist or which one it is processing — it simply reads the current parameters and performs the dynamic read/write.
 
 ```python
 dbutils.widgets.text("source_container", "bronze")
@@ -501,13 +501,13 @@ df.write.format('delta') \
     .saveAsTable(f"olympic.{sink_container}.{folder}")
 ```
 
-*   **Task name**: `parameterized_ingestion`
+*   **Task name**: `silver_loop_iteration`
 *   **Type**: Notebook
-*   **Input**: Three Widgets (`source_container`, `sink_container`, `folder`)
+*   **Input**: Three Widgets populated by the parent `For each` Task using `{{input.xxx}}`
 
 #### 12.7.2 Notebook B: Lookup (Define the Parameter Array)
 
-Notebook B defines the array of parameter dictionaries and stores it as a **Task Value** so that downstream Tasks can read it.
+Notebook B defines the array of parameter dictionaries and stores it as a **Task Value** so that the `For each` Task can read it.
 
 ```python
 my_array = [
@@ -524,29 +524,45 @@ dbutils.jobs.taskValues.set(key="my_output", value=my_array)
 
 > **Note**: The `value` argument must be the array object itself (`my_array`), not a string (`"my_array"`).
 
-#### 12.7.3 Job Configuration: Passing Task Values to Widgets
+#### 12.7.3 Job Configuration: For Each Task
 
-In the Job configuration for Task 2, the Widgets of Notebook A are populated dynamically from the Task Value produced by Task 1. The syntax is:
+The second Task is configured as a **`For each`** Task:
 
-```
-source_container = {{tasks.lookup.values.my_output[0].source_container}}
-sink_container   = {{tasks.lookup.values.my_output[0].sink_container}}
-folder           = {{tasks.lookup.values.my_output[0].folder}}
-```
+*   **Task name**: `silver_loop`
+*   **Type**: `For each`
+*   **Inputs**: `{{tasks.lookup.values.my_output}}`
+*   **Depends on**: `lookup`
+*   **Run if dependencies**: `All succeeded`
 
-Each Task can be configured to pass a different index of the array, so the same Notebook A can process different tables without any code changes.
+Inside the `For each` Task, a single child Task (`silver_loop_iteration`) is configured as a Notebook Task. Its Widgets are populated using the `{{input.xxx}}` syntax, where `input` refers to the current element of the array being iterated:
 
-#### 12.7.4 Comparison with ADF
+| Widget Key | Value |
+| :--- | :--- |
+| `source_container` | `{{input.source_container}}` |
+| `sink_container` | `{{input.sink_container}}` |
+| `folder` | `{{input.folder}}` |
+
+#### 12.7.4 Why This Design Is Better
+
+| Design | Approach | Pros | Cons |
+| :--- | :--- | :--- | :--- |
+| **Hardcoded Index** | One Task per table, using `my_output[0]`, `my_output[1]`, etc. | Simple to configure for a fixed number of tables | Must add a new Task each time the array grows |
+| **For Each Task** (this project) | One `For each` Task iterating over the whole array | Dynamically scales with the array; no code changes when adding new tables | Slightly more complex initial setup |
+
+By using the native `For each` Task, the Job automatically processes every table defined in `my_array`. Adding a new table only requires editing the array in Notebook B — no changes to the Job configuration.
+
+#### 12.7.5 Comparison with ADF
 
 | Concept | ADF | Databricks Jobs |
 | :--- | :--- | :--- |
 | **Manifest** | External JSON file | Python array in Notebook B |
 | **Read Manifest** | Lookup activity | `dbutils.jobs.taskValues.set(...)` in Notebook B |
-| **Parameter Passing** | `@item().xxx` | `{{tasks.lookup.values.my_output[i].xxx}}` in Job config |
-| **Iteration** | ForEach activity | Separate Job Tasks (one per table) |
+| **Iteration** | ForEach activity | `For each` Task in Job |
+| **Parameter Passing** | `@item().xxx` | `{{input.xxx}}` inside the For each Task |
 | **Dynamic Write** | Dataset parameters | Widgets in Notebook A |
 
 This pattern demonstrates the same **metadata-driven** philosophy across ADF and Databricks, using each tool's native orchestration mechanism.
+
 
 ## References
 
