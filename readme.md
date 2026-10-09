@@ -542,6 +542,10 @@ Inside the `For each` Task, a single child Task (`silver_loop_iteration`) is con
 | `sink_container` | `{{input.sink_container}}` |
 | `folder` | `{{input.folder}}` |
 
+![For Each Task Configuration](assets/job_for_each_config.png)
+
+![Child Task Parameters](assets/job_parameters.png)
+
 #### 12.7.4 Why This Design Is Better
 
 | Design | Approach | Pros | Cons |
