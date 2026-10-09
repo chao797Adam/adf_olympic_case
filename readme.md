@@ -923,6 +923,215 @@ A scatter plot is used to visualize the relationship between athlete height and 
 | 12 | Top 10 nationalities | Bar chart with `.limit(10)` |
 | 13 | Height vs. weight correlation | Scatter plot |
 
+#### 12.8.15 Window Functions: `rowsBetween` vs. Default Window
+
+By default, a window with `orderBy` computes a **running total**. By adding `rowsBetween`, the window boundaries can be redefined.
+
+**Version 1: Default Window (Running Total)**
+```python
+df_final = df_final.withColumn(
+    'cum_weight',
+    F.sum('weight').over(
+        Window.partitionBy('nationality').orderBy('height')
+    )
+)
+```
+
+**Version 2: Full Partition (Total Sum per Group)**
+```python
+df_final = df_final.withColumn(
+    'cum_weight',
+    F.sum('weight').over(
+        Window.partitionBy('nationality')
+              .orderBy('height')
+              .rowsBetween(Window.unboundedPreceding, Window.unboundedFollowing)
+    )
+)
+```
+
+**Comparison (Japan as an example):**
+
+| name | height | weight | Version 1 | Version 2 |
+| :--- | :--- | :--- | :--- | :--- |
+| A | 165 | 60 | 60 | 300 |
+| B | 175 | 70 | 130 | 300 |
+| C | 185 | 80 | 210 | 300 |
+| D | 195 | 90 | 300 | 300 |
+
+**Explanation:**
+*   **Version 1**: Without `rowsBetween`, Spark defaults to `RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW`. The window grows as it moves down the partition → **running total**.
+*   **Version 2**: With `rowsBetween(unboundedPreceding, unboundedFollowing)`, the window spans the entire partition for every row → **total sum repeated on every row**.
+
+**Key difference:**
+
+| Aspect | Version 1 (Default) | Version 2 (`rowsBetween`) |
+| :--- | :--- | :--- |
+| Window range | First row → current row | First row → last row |
+| Output | Running total | Total sum (repeated) |
+| Rows retained | All rows | All rows |
+| Equivalent to | — | `groupBy().agg(sum())`, but keeps all rows |
+
+
+#### 12.8.16 Window Functions in SQL (via Temp View)
+
+Instead of using the PySpark API, window functions can also be written directly in SQL by first registering the DataFrame as a temporary view.
+
+**Step 1: Register the DataFrame as a Temp View**
+```python
+df_final.createOrReplaceTempView("athletes")
+```
+
+**Step 2: Run a SQL query with a Window Function**
+```python
+df_new = spark.sql("""
+SELECT
+    nationality,
+    height,
+    weight,
+    SUM(weight) OVER (
+        PARTITION BY nationality
+        ORDER BY height
+        ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+    ) AS total_weight
+FROM athletes
+""")
+
+df_new.display()
+```
+
+**Explanation:**
+*   `createOrReplaceTempView("athletes")` — Registers the DataFrame as a SQL-queryable view (session-scoped, not persisted).
+*   `SUM(weight) OVER (...)` — Same window logic as the PySpark version, but expressed in SQL.
+*   `ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW` — Explicit running total (from the first row to the current row).
+
+**Comparison: PySpark API vs. SQL**
+
+| Aspect | PySpark API | SQL |
+| :--- | :--- | :--- |
+| Syntax | `.withColumn(...)`, `F.sum(...).over(Window...)` | `SELECT ... OVER (...)` |
+| Readability | Programmatic, chainable | Declarative, easier to read for SQL users |
+| Use case | Complex pipelines, dynamic logic | Ad-hoc analysis, BI-style queries |
+| Temp view needed | No | Yes (`createOrReplaceTempView`) |
+
+**Why this matters:**
+Both approaches produce the same result. Choosing between them is a matter of team preference and context:
+*   **PySpark API** is better for production pipelines with complex transformations.
+*   **SQL** is often faster to write for exploratory analysis and is more accessible to analysts who know SQL but not Python.
+
+**Key takeaway:**
+The window logic (`PARTITION BY`, `ORDER BY`, `ROWS BETWEEN`) is identical in both. Once you understand it in one syntax, you can translate it to the other effortlessly.
+
+#### 12.8.17 Writing the Final DataFrame to the Silver Layer
+
+After all cleaning, profiling, and validation steps are complete, the final DataFrame is written to the Silver layer as an External Delta Table registered in Unity Catalog.
+
+```python
+df_final.write.format("delta") \
+    .mode("overwrite") \
+    .option("path", "abfss://silver@xc797demo.dfs.core.windows.net/athletes") \
+    .saveAsTable("olympic.silver.athletes")
+```
+
+**What this does:**
+*   **Writes physical data** to `abfss://silver@xc797demo.dfs.core.windows.net/athletes` (Delta Parquet files + `_delta_log`).
+*   **Registers metadata** in Unity Catalog under `olympic.silver.athletes`.
+*   **Uses `overwrite` mode** so the table always reflects the latest cleaned data.
+
+**Verification:**
+
+1.  **Check the ADLS path**:
+    *   Navigate to `abfss://silver@xc797demo.dfs.core.windows.net/athletes`.
+    *   Confirm the presence of Delta Parquet files and a `_delta_log` directory.
+
+2.  **Query the table via SQL**:
+    ```sql
+    SELECT * FROM olympic.silver.athletes LIMIT 10;
+    ```
+
+3.  **Check the metadata**:
+    ```sql
+    DESCRIBE EXTENDED olympic.silver.athletes;
+    ```
+    The output should show the `Location` pointing to the ADLS path.
+
+**Silver layer output summary:**
+
+| Table | Physical Path | Unity Catalog Name |
+| :--- | :--- | :--- |
+| `nocs` | `abfss://silver@.../nocs` | `olympic.silver.nocs` |
+| `events` | `abfss://silver@.../events` | `olympic.silver.events` |
+| `coaches` | `abfss://silver@.../coaches` | `olympic.silver.coaches` |
+| `athletes` | `abfss://silver@.../athletes` | `olympic.silver.athletes` |
+
+---
+
+#### 12.8.18 Design Decision: Why `overwrite` Instead of `append`
+
+Choosing between `append` and `overwrite` is a critical design decision. In this project, `overwrite` is used for the following reasons:
+
+**1. No incremental load model**
+The source data is a full snapshot (all records, every run). There is no watermark, timestamp, or change data capture (CDC) stream that identifies only new or modified records.
+
+**2. Idempotent re-runs**
+Re-running the pipeline should produce the same result. With `overwrite`, the Silver table always contains exactly one clean copy of the data — no duplicates, no accumulation.
+
+**3. Predictable downstream logic**
+The Gold layer reads from the Silver layer. If Silver contained duplicates, Gold aggregations would be wrong. `overwrite` guarantees a clean, single-copy source for all downstream processing.
+
+**Comparison:**
+
+| Mode | Behavior on Re-run | Effect |
+| :--- | :--- | :--- |
+| `append` | Adds new rows without deleting existing ones | **Data duplication** (row count doubles each run) |
+| `overwrite` | Replaces the entire table | **Idempotent** (row count stays constant) |
+
+**When `append` would be correct:**
+If the pipeline later evolves to support **incremental ingestion** (e.g., daily new files, CDC feeds), the correct pattern would be a **Delta Merge (Upsert)**:
+
+```python
+from delta.tables import DeltaTable
+
+delta_table = DeltaTable.forName(spark, "olympic.silver.athletes")
+
+delta_table.alias("target").merge(
+    df_final.alias("source"),
+    "target.athlete_code = source.athlete_code"
+).whenMatchedUpdateAll() \
+ .whenNotMatchedInsertAll() \
+ .execute()
+```
+
+**Key takeaway:**
+*   **Full-refresh pipeline** → use `overwrite`.
+*   **Incremental pipeline** → use `append` + `merge` (with a business key).
+
+Since this project performs full-refresh loads, `overwrite` is the correct and safe choice.
+
+#### 12.9 Consistency with Delta Live Tables (DLT) for the Gold Layer
+
+The Silver layer uses `overwrite` mode. This is intentional and consistent with the design of the upcoming Gold layer, which will be built using **Delta Live Tables (DLT)**.
+
+**Why `overwrite` aligns with DLT:**
+
+1.  **Full Refresh is the default in DLT**
+    DLT's `REFRESH` operation is equivalent to a full rewrite of the table. Every run produces the same clean result — no accumulation, no duplication.
+
+2.  **Idempotent pipeline design**
+    Both the Silver (`overwrite`) and Gold (`REFRESH`) layers are idempotent. Running the pipeline any number of times produces the same output.
+
+3.  **Stable input for downstream**
+    DLT expects stable, clean input. If Silver used `append`, every DLT refresh would double the data, breaking Gold aggregations.
+
+**Pipeline-level consistency:**
+
+| Layer | Tool | Write Mode | Idempotent? |
+| :--- | :--- | :--- | :--- |
+| **Bronze** | ADF | `overwrite` | ✅ |
+| **Silver** | Databricks Notebook | `overwrite` (External Table) | ✅ |
+| **Gold** | DLT | `REFRESH` (default) | ✅ |
+
+**Key takeaway:**
+Using `overwrite` in the Silver layer is not just correct for the current pipeline — it's a deliberate design choice that prepares the data for DLT-based Gold transformations.
 
 ## References
 
