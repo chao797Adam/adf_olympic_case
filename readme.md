@@ -473,6 +473,81 @@ By changing the `folder` widget value, the same Notebook can process different d
 | `coaches` | `abfss://bronze@.../coaches` | `olympic.silver.coaches` |
 | `events` | `abfss://bronze@.../events` | `olympic.silver.events` |
 
+### 12.7 Orchestrating Multiple Tables with Databricks Jobs
+
+Instead of using a Python `for` loop, this project uses **Databricks Jobs** to orchestrate the processing of multiple tables. Parameters are passed between Tasks using **Task Values**, and the ingestion Notebook remains fully parameterized via **Widgets**.
+
+#### 12.7.1 Notebook A: Parameterized Ingestion
+
+Notebook A is a fully parameterized Notebook. It does not care where the parameters come from — it only reads them via **Widgets** and performs the dynamic read/write.
+
+```python
+dbutils.widgets.text("source_container", "bronze")
+dbutils.widgets.text("sink_container", "silver")
+dbutils.widgets.text("folder", "nocs")
+
+source_container = dbutils.widgets.get("source_container")
+sink_container   = dbutils.widgets.get("sink_container")
+folder           = dbutils.widgets.get("folder")
+
+df = spark.read.format('parquet') \
+    .option('header', True) \
+    .option('inferSchema', True) \
+    .load(f'abfss://{source_container}@xc797demo.dfs.core.windows.net/{folder}')
+
+df.write.format('delta') \
+    .mode('append') \
+    .option("path", f'abfss://{sink_container}@xc797demo.dfs.core.windows.net/{folder}') \
+    .saveAsTable(f"olympic.{sink_container}.{folder}")
+```
+
+*   **Task name**: `parameterized_ingestion`
+*   **Type**: Notebook
+*   **Input**: Three Widgets (`source_container`, `sink_container`, `folder`)
+
+#### 12.7.2 Notebook B: Lookup (Define the Parameter Array)
+
+Notebook B defines the array of parameter dictionaries and stores it as a **Task Value** so that downstream Tasks can read it.
+
+```python
+my_array = [
+    {"source_container": "bronze", "sink_container": "silver", "folder": "events"},
+    {"source_container": "bronze", "sink_container": "silver", "folder": "coaches"}
+]
+
+dbutils.jobs.taskValues.set(key="my_output", value=my_array)
+```
+
+*   **Task name**: `lookup`
+*   **Type**: Notebook
+*   **Output**: Stores the array as a Task Value named `my_output`.
+
+> **Note**: The `value` argument must be the array object itself (`my_array`), not a string (`"my_array"`).
+
+#### 12.7.3 Job Configuration: Passing Task Values to Widgets
+
+In the Job configuration for Task 2, the Widgets of Notebook A are populated dynamically from the Task Value produced by Task 1. The syntax is:
+
+```
+source_container = {{tasks.lookup.values.my_output[0].source_container}}
+sink_container   = {{tasks.lookup.values.my_output[0].sink_container}}
+folder           = {{tasks.lookup.values.my_output[0].folder}}
+```
+
+Each Task can be configured to pass a different index of the array, so the same Notebook A can process different tables without any code changes.
+
+#### 12.7.4 Comparison with ADF
+
+| Concept | ADF | Databricks Jobs |
+| :--- | :--- | :--- |
+| **Manifest** | External JSON file | Python array in Notebook B |
+| **Read Manifest** | Lookup activity | `dbutils.jobs.taskValues.set(...)` in Notebook B |
+| **Parameter Passing** | `@item().xxx` | `{{tasks.lookup.values.my_output[i].xxx}}` in Job config |
+| **Iteration** | ForEach activity | Separate Job Tasks (one per table) |
+| **Dynamic Write** | Dataset parameters | Widgets in Notebook A |
+
+This pattern demonstrates the same **metadata-driven** philosophy across ADF and Databricks, using each tool's native orchestration mechanism.
+
 ## References
 
 *   **Course Video**: [YouTube Tutorial - Azure Data Factory Project](https://www.youtube.com/watch?v=ESWqAZP2qA4&t=2s)
