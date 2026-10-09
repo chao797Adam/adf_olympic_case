@@ -567,6 +567,16 @@ By using the native `For each` Task, the Job automatically processes every table
 
 This pattern demonstrates the same **metadata-driven** philosophy across ADF and Databricks, using each tool's native orchestration mechanism.
 
+#### 12.7.6 Verified Run Output
+
+After fixing the `taskValues.set` call (passing the array object, not a string), the Job ran successfully.
+
+| Iteration | Folder | Sink Table | Status |
+| :--- | :--- | :--- | :--- |
+| 1 | `events` | `olympic.silver.events` | ✅ Succeeded |
+| 2 | `coaches` | `olympic.silver.coaches` | ✅ Succeeded |
+
+![For Each Run Result](assets/job_for_each_run.png)
 
 ## References
 
