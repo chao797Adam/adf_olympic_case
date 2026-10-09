@@ -422,6 +422,56 @@ The Unity Catalog Metastore is configured with a root storage path (`abfss://uni
 *   **External Tables** are used to maintain explicit control over data location and avoid Managed Table complexity.
 *   **Unity Catalog** provides metadata management, governance, and SQL access to the Silver tables.
 
+### 12.6 Dynamic Parameterization with Databricks Widgets
+
+To avoid hardcoding container names and folder paths, the Notebook uses **Databricks Widgets** to accept parameters at runtime. This makes the same Notebook reusable for multiple tables and allows it to be triggered dynamically by a Databricks Job.
+
+#### 12.6.1 Defining Widgets
+
+At the top of the Notebook, define the parameters:
+
+```python
+dbutils.widgets.text("source_container", "bronze")
+dbutils.widgets.text("sink_container", "silver")
+dbutils.widgets.text("folder", "nocs")
+
+source_container = dbutils.widgets.get("source_container")
+sink_container   = dbutils.widgets.get("sink_container")
+folder           = dbutils.widgets.get("folder")
+```
+
+#### 12.6.2 Dynamic Read and Write
+
+The Notebook reads from the source container and writes to the sink container, both driven by widget parameters:
+
+```python
+df = spark.read.format('parquet') \
+    .option('header', True) \
+    .option('inferSchema', True) \
+    .load(f'abfss://{source_container}@xc797demo.dfs.core.windows.net/{folder}')
+
+df.write.format('delta') \
+    .mode('append') \
+    .option("path", f'abfss://{sink_container}@xc797demo.dfs.core.windows.net/{folder}') \
+    .saveAsTable(f"olympic.{sink_container}.{folder}")
+```
+
+#### 12.6.3 Benefits of This Design
+
+*   **Reusability**: One Notebook can handle any table by changing the widget values.
+*   **Job-friendly**: A Databricks Job can pass different parameters for each run, enabling batch processing of multiple tables.
+*   **CI/CD-ready**: Parameters can be supplied externally (e.g., by ADF or Azure DevOps) without modifying the Notebook.
+
+#### 12.6.4 Example: Processing Multiple Tables
+
+By changing the `folder` widget value, the same Notebook can process different datasets:
+
+| `folder` value | Source Path | Sink Table |
+| :--- | :--- | :--- |
+| `nocs` | `abfss://bronze@.../nocs` | `olympic.silver.nocs` |
+| `athletes` | `abfss://bronze@.../athletes` | `olympic.silver.athletes` |
+| `coaches` | `abfss://bronze@.../coaches` | `olympic.silver.coaches` |
+| `events` | `abfss://bronze@.../events` | `olympic.silver.events` |
 
 ## References
 
