@@ -1133,11 +1133,6 @@ The Silver layer uses `overwrite` mode. This is intentional and consistent with 
 **Key takeaway:**
 Using `overwrite` in the Silver layer is not just correct for the current pipeline — it's a deliberate design choice that prepares the data for DLT-based Gold transformations.
 
-没问题，先把这个阶段的 DLT 逻辑总结清楚。跑通的事情你慢慢研究，下面这段可以直接加进 README 作为 **第 13 节**。
-
----
-
-```markdown
 ## 13. Databricks Gold Layer (Delta Live Tables)
 
 After the Silver layer is complete, the Gold layer is built using **Delta Live Tables (DLT)**. DLT provides a declarative framework for defining data pipelines, automatically handling dependencies, orchestration, and data quality.
