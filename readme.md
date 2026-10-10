@@ -1133,6 +1133,168 @@ The Silver layer uses `overwrite` mode. This is intentional and consistent with 
 **Key takeaway:**
 Using `overwrite` in the Silver layer is not just correct for the current pipeline — it's a deliberate design choice that prepares the data for DLT-based Gold transformations.
 
+没问题，先把这个阶段的 DLT 逻辑总结清楚。跑通的事情你慢慢研究，下面这段可以直接加进 README 作为 **第 13 节**。
+
+---
+
+```markdown
+## 13. Databricks Gold Layer (Delta Live Tables)
+
+After the Silver layer is complete, the Gold layer is built using **Delta Live Tables (DLT)**. DLT provides a declarative framework for defining data pipelines, automatically handling dependencies, orchestration, and data quality.
+
+### 13.1 Why Delta Live Tables
+
+DLT is chosen for the Gold layer for the following reasons:
+
+1.  **Declarative pipeline definition**
+    Each Gold table is defined as a function returning a DataFrame. DLT automatically resolves dependencies between tables.
+
+2.  **Automatic orchestration**
+    The execution order is determined by data lineage, not by manual sequencing. Adding a new table only requires declaring it — DLT handles the rest.
+
+3.  **Built-in data quality checks**
+    DLT supports `@dlt.expect`, `@dlt.expect_or_drop`, and `@dlt.expect_or_fail`, allowing data quality rules to be declared alongside the transformation logic.
+
+4.  **Full-refresh consistency with Silver**
+    The Silver layer uses `overwrite` mode (Section 12.8.18). DLT's default `REFRESH` behavior aligns with this — every run produces the same clean result. The pipeline is fully idempotent.
+
+### 13.2 Pipeline Structure
+
+```
+olympic.silver.athletes ─┐
+olympic.silver.nocs ─────┼──► gold_athletes_enriched
+                         │
+olympic.silver.coaches ──┼──► gold_coaches_enriched
+                         │
+olympic.silver.events ───┴──► gold_events_enriched
+```
+
+Each Gold table is defined in the `transformations/` folder of the DLT Pipeline.
+
+### 13.3 Gold Table 1: `gold_athletes_enriched`
+
+Joins `athletes` with `nocs` on `country_code = code` to enrich athlete records with authoritative country names.
+
+```python
+import dlt
+from pyspark.sql.functions import col
+
+@dlt.table(
+    name="gold_athletes_enriched",
+    comment="Wide table: athletes joined with nocs for country information"
+)
+def gold_athletes_enriched():
+    athletes = spark.read.table("olympic.silver.athletes")
+    nocs = spark.read.table("olympic.silver.nocs")
+
+    return (
+        athletes.alias("a")
+            .join(
+                nocs.alias("n"),
+                col("a.country_code") == col("n.code"),
+                "left"
+            )
+            .select(
+                col("a.athlete_code"),
+                col("a.name"),
+                col("a.gender"),
+                col("a.function"),
+                col("a.country_code"),
+                col("a.country_long").alias("athlete_country_long"),
+                col("n.country_long").alias("nocs_country_long"),
+                col("a.nationality"),
+                col("a.height"),
+                col("a.weight"),
+                col("a.current")
+            )
+    )
+```
+
+### 13.4 Gold Table 2: `gold_coaches_enriched`
+
+Joins `coaches` with `nocs` on `country_code = code` to enrich coach records with country names.
+
+```python
+@dlt.table(
+    name="gold_coaches_enriched",
+    comment="Wide table: coaches joined with nocs for country information"
+)
+def gold_coaches_enriched():
+    coaches = spark.read.table("olympic.silver.coaches")
+    nocs = spark.read.table("olympic.silver.nocs")
+
+    return (
+        coaches.alias("c")
+            .join(
+                nocs.alias("n"),
+                col("c.country_code") == col("n.code"),
+                "left"
+            )
+            .select(
+                col("c.code").alias("coach_code"),
+                col("c.name"),
+                col("c.gender"),
+                col("c.function"),
+                col("c.category"),
+                col("c.country_code"),
+                col("c.country_long").alias("coach_country_long"),
+                col("n.country_long").alias("nocs_country_long"),
+                col("c.disciplines"),
+                col("c.events"),
+                col("c.birth_date"),
+                col("c.current")
+            )
+    )
+```
+
+### 13.5 Gold Table 3: `gold_events_enriched`
+
+The `events` table is a dimension table (events, sports, tags) without a join key. It is exposed as a standalone Gold table.
+
+```python
+@dlt.table(
+    name="gold_events_enriched",
+    comment="Events with sport and tag information"
+)
+def gold_events_enriched():
+    return (
+        spark.read.table("olympic.silver.events")
+             .select("event", "tag", "sport", "sport_code", "sport_url")
+    )
+```
+
+### 13.6 Data Model Limitations
+
+The Gold layer is constrained by the structure of the source data:
+
+1.  **`events` has no foreign key**
+    The `events` table describes Olympic events but does not contain an `athlete_code` or a `country_code`. It cannot be joined with `athletes`. To produce an "athlete-event" relationship, an additional association table (e.g., `athlete_events`) would be required.
+
+2.  **`coaches` cannot be joined with `athletes`**
+    The `coaches` table has a `country_code` but no `athlete_code`. It can only be joined with `nocs`, not with `athletes`.
+
+3.  **No timestamp or CDC columns**
+    None of the source tables contain `created_at`, `updated_at`, or version columns. As a result, SCD Type 2 (history tracking) is not applicable. The pipeline runs in full-refresh mode, which is SCD Type 1 by nature.
+
+### 13.7 Summary
+
+The Gold layer is defined using Delta Live Tables and produces three enriched wide tables:
+
+| Gold Table | Source Tables | Join Key |
+| :--- | :--- | :--- |
+| `gold_athletes_enriched` | `athletes` + `nocs` | `country_code = code` |
+| `gold_coaches_enriched` | `coaches` + `nocs` | `country_code = code` |
+| `gold_events_enriched` | `events` | *(no join)* |
+
+**Project status:**
+
+| Layer | Tool | Status |
+| :--- | :--- | :--- |
+| **Bronze** | Azure Data Factory | ✅ Completed |
+| **Silver** | Databricks Notebook | ✅ Completed |
+| **Gold** | Delta Live Tables | ✅ Implemented |
+| **Documentation** | This README | ✅ Completed |
+
 ## References
 
 *   **Course Video**: [YouTube Tutorial - Azure Data Factory Project](https://www.youtube.com/watch?v=ESWqAZP2qA4&t=2s)
